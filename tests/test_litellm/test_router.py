@@ -4828,6 +4828,12 @@ async def test_router_ttft_timeout_returns_non_streaming_response():
 
     assert result is reconstructed
     fake_stream.aclose.assert_awaited_once()
+    # Convert-to-streaming observability is surfaced on _hidden_params (propagated into the
+    # StandardLoggingObject) so downstream CustomLoggers can build TTFT / inter-token-gap metrics
+    # and split the internally-promoted path from ordinary traffic.
+    assert result._hidden_params["ttft_converted"] is True
+    assert "ttft_seconds" in result._hidden_params
+    assert "stream_max_inter_token_gap_seconds" in result._hidden_params
 
 
 @pytest.mark.asyncio

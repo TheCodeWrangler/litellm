@@ -2868,10 +2868,31 @@ class Router:
         chunks: List = []
         aiter = response.__aiter__()
 
+        # Observability for the internally-promoted (non-streaming caller -> stream) path: time-to-first
+        # (content) token and the worst gap between consecutive chunks. These are only measurable while
+        # iterating here, so we capture them and surface them on the reconstructed response's
+        # _hidden_params below (litellm copies _hidden_params into the StandardLoggingObject), letting
+        # any CustomLogger emit TTFT / inter-token-gap metrics and split this path from ordinary calls.
+        loop = asyncio.get_running_loop()
+        t_start = loop.time()
+        first_content_t: Optional[float] = None
+        last_chunk_t: Optional[float] = None
+        max_inter_token_gap: float = 0.0
+
+        def _record_timing(chunk: Any) -> None:
+            nonlocal first_content_t, last_chunk_t, max_inter_token_gap
+            now = loop.time()
+            if last_chunk_t is not None:
+                max_inter_token_gap = max(max_inter_token_gap, now - last_chunk_t)
+            last_chunk_t = now
+            if first_content_t is None:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta and (delta.content or delta.tool_calls):
+                    first_content_t = now
+
         try:
             if ttft_timeout is not None:
-                loop = asyncio.get_running_loop()
-                deadline = loop.time() + ttft_timeout
+                deadline = t_start + ttft_timeout
                 first_token_received = False
 
                 while not first_token_received:
@@ -2895,6 +2916,7 @@ class Router:
                     except StopAsyncIteration:
                         break
                     chunks.append(chunk)
+                    _record_timing(chunk)
                     delta = chunk.choices[0].delta if chunk.choices else None
                     if delta and (delta.content or delta.tool_calls):
                         first_token_received = True
@@ -2918,9 +2940,11 @@ class Router:
                     except StopAsyncIteration:
                         break
                     chunks.append(chunk)
+                    _record_timing(chunk)
             else:
                 async for chunk in aiter:
                     chunks.append(chunk)
+                    _record_timing(chunk)
         finally:
             await response.aclose()
 
@@ -2932,7 +2956,20 @@ class Router:
                 llm_provider="",
                 model="",
             )
-        return cast(ModelResponse, result)
+        result = cast(ModelResponse, result)
+
+        # Surface convert-to-streaming observability on _hidden_params (propagated into the
+        # StandardLoggingObject). `ttft_converted` marks the internally-promoted path so callers can
+        # split it from ordinary traffic; the timing fields feed TTFT / inter-token-gap metrics.
+        hidden = getattr(result, "_hidden_params", None)
+        if not isinstance(hidden, dict):
+            hidden = {}
+        hidden["ttft_converted"] = True
+        if first_content_t is not None:
+            hidden["ttft_seconds"] = round(first_content_t - t_start, 6)
+        hidden["stream_max_inter_token_gap_seconds"] = round(max_inter_token_gap, 6)
+        result._hidden_params = hidden
+        return result
 
     async def _acompletion(  # noqa: PLR0915
         self, model: str, messages: List[Dict[str, str]], **kwargs
